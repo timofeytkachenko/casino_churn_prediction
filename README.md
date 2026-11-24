@@ -22,8 +22,10 @@ Both scripts are seeded; re-running them reproduces the same data and artifacts.
 
 `churn_survival.ipynb` walks through the same steps as the two scripts, one section per
 requirement, with every table and chart inline. It is saved with its outputs, and running
-it writes the same `data/` and `artifacts/` as the scripts do. Jupyter is not a project
-dependency; `--with` supplies it for one run:
+it writes the same `data/` and `artifacts/` as the scripts do. The project environment
+has `ipykernel` and `nbformat`, so an editor such as Cursor or VS Code can run it with
+`.venv` as the kernel. JupyterLab and `nbclient` are not dependencies; `--with` supplies
+them for one run:
 
 ```bash
 uv run --with jupyterlab jupyter lab churn_survival.ipynb
