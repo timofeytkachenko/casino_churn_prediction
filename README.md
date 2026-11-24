@@ -32,6 +32,13 @@ uv run --with jupyterlab jupyter lab churn_survival.ipynb
 uv run --with ipykernel --with nbclient jupyter-execute churn_survival.ipynb --inplace
 ```
 
+Two more notebooks read the saved `data/` and `artifacts/` and write nothing:
+
+- `predict_debug.ipynb` follows one prediction from the raw tables to the scorecard and
+  prints every intermediate array with its shape and meaning, checking each step against
+  the library.
+- `predict_players.ipynb` scores one or several players by `player_id` on a chosen date.
+
 ## Problem setup
 
 - **Churn** is the first run of 30 consecutive days without activity, dated on the
@@ -79,6 +86,8 @@ churn/models.py          XGBoost Cox and AFT with a common survival interface
 churn/evaluation.py      metrics, calibration, bootstrap, hazard and RUL tables
 churn/pipeline.py        end-to-end run and artifact export
 churn_survival.ipynb     the same run as a notebook with inline charts
+predict_debug.ipynb      one prediction step by step: calls, arrays, shapes, checks
+predict_players.ipynb    prediction for selected players on a chosen date
 dashboard/app.py         Streamlit dashboard; dashboard/i18n.py holds the translations
 tests/                   pytest suite for features, models and evaluation
 ```
