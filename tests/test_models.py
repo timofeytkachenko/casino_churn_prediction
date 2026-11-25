@@ -1,5 +1,7 @@
 """Tests for the XGBoost Cox and AFT survival models."""
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -108,3 +110,69 @@ def test_fit_rejects_non_positive_durations(data):
     X, time, event = data
     with pytest.raises(ValueError, match="strictly positive"):
         CoxModel(PARAMS).fit(X, np.where(np.arange(len(time)) == 0, 0.0, time), event)
+
+
+@pytest.fixture(scope="module")
+def delayed(data) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """The same durations, each preceded by a period in which the event cannot happen."""
+    X, time, event = data
+    wait = np.random.default_rng(1).integers(0, 15, len(X))
+    return X.assign(wait=wait), time + wait, event
+
+
+@pytest.mark.parametrize("name", sorted(MODELS))
+def test_delay_shifts_the_time_origin(name, data, delayed):
+    X, time, event = data
+    X_delayed, time_delayed, _ = delayed
+    wait = X_delayed["wait"].to_numpy()
+    plain = MODELS[name](PARAMS, num_boost_round=60).fit(X, time, event)
+    model = MODELS[name](PARAMS, num_boost_round=60, delay_column="wait")
+    model.fit(X_delayed, time_delayed, event)
+
+    # The delay is the time origin, not a feature: the booster is the plain one.
+    assert model.feature_names_ == list(X.columns)
+    np.testing.assert_allclose(model.predict_margin(X_delayed), plain.predict_margin(X))
+
+    survival = model.predict_survival(X_delayed, TIMES)
+    reference = plain.predict_survival(X, TIMES)
+    assert np.all(np.diff(survival, axis=1) <= 1e-12)
+    for days in np.unique(wait):
+        rows = wait == days
+        assert np.all(survival[rows, :days] == 1.0)  # the event is impossible so far
+        np.testing.assert_allclose(survival[rows, days:], reference[rows, : TIMES.size - days])
+
+
+def test_delay_drops_uninformative_rows_and_rejects_impossible_events(data, delayed):
+    X, time, event = delayed
+    plain = AFTModel(PARAMS, num_boost_round=20, delay_column="wait").fit(X, time, event)
+
+    # Rows censored on or before the last day of their delay add nothing.
+    extra = X.head(50).assign(wait=10)
+    X_more = pd.concat([X, extra], ignore_index=True)
+    time_more = np.concatenate([time, np.linspace(1, 10, 50).round()])
+    event_more = np.concatenate([event, np.zeros(50, dtype=bool)])
+    model = AFTModel(PARAMS, num_boost_round=20, delay_column="wait")
+    model.fit(X_more, time_more, event_more)
+    np.testing.assert_array_equal(model.predict_margin(X), plain.predict_margin(X))
+
+    event_more[-1] = True
+    with pytest.raises(ValueError, match="before the delay"):
+        model.fit(X_more, time_more, event_more)
+
+
+def test_delay_column_survives_save_and_load(delayed, tmp_path):
+    X, time, event = delayed
+    model = CoxModel(PARAMS, num_boost_round=20, delay_column="wait").fit(X, time, event)
+    model.save(tmp_path / "model")
+    restored = CoxModel.load(tmp_path / "model")
+    assert restored.delay_column == "wait"
+    np.testing.assert_allclose(
+        restored.predict_survival(X, TIMES), model.predict_survival(X, TIMES), rtol=1e-6
+    )
+
+    # A meta file written before delays existed loads as a model without one.
+    meta_path = tmp_path / "model.meta.json"
+    meta = json.loads(meta_path.read_text())
+    del meta["delay_column"]
+    meta_path.write_text(json.dumps(meta))
+    assert CoxModel.load(tmp_path / "model").delay_column is None

@@ -71,6 +71,8 @@ def test_snapshot_features_windows_and_eligibility():
     row = frame.iloc[0]
     assert row["tenure_days"] == 59
     assert row["recency_days"] == 2
+    assert row[config.DELAY_COLUMN] == 28  # the 30-day run can end on day 29 at the earliest
+    assert config.DELAY_COLUMN not in config.FEATURES
     assert row["active_days_7d"] == 1
     assert row["active_days_30d"] == 3
     assert row["activity_ratio_7d_30d"] == pytest.approx((1 / 7) / (3 / 30))
@@ -139,3 +141,7 @@ def test_at_risk_invariants(simulated):
     # A player who never returns churns INACTIVITY_DAYS after the last active day.
     events = labelled[labelled["event"]]
     assert np.all(events["time"] + events["recency_days"] >= config.INACTIVITY_DAYS + 1)
+    # The same bound as the delay the models start their clock from.
+    assert (frame[config.DELAY_COLUMN] == config.INACTIVITY_DAYS - frame["recency_days"]).all()
+    assert (events["time"] > events[config.DELAY_COLUMN]).all()
+    assert (events["time"] == events[config.DELAY_COLUMN] + 1).any()

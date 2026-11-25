@@ -114,6 +114,90 @@ def test_calibrator_guards(sample):
         calibrator.transform(surv[:, :10], TIMES[:10])
 
 
+def test_calibrator_keeps_certain_survival_certain():
+    """Days on which churn is impossible (raw S = 1 exactly) stay at S = 1."""
+    rng = np.random.default_rng(1)
+    n = 3000
+    delay = rng.integers(0, 30, n)
+    rate = rng.lognormal(0.0, 0.7, n) / 40
+    true_time = delay + np.ceil(rng.exponential(1 / rate))
+    event = true_time < FOLLOW_UP
+    time = np.where(event, true_time, FOLLOW_UP)
+    after_delay = np.clip(TIMES[None, :] - delay[:, None], 0, None)
+    raw = np.exp(-rate[:, None] * after_delay) ** 3  # too pessimistic once churn is possible
+    fit, hold = np.arange(n) < 1500, np.arange(n) >= 1500
+
+    calibrator = ev.IsotonicSurvivalCalibrator().fit(raw[fit], time[fit], event[fit], TIMES)
+    calibrated = calibrator.transform(raw[hold], TIMES)
+
+    impossible = TIMES[None, :] <= delay[hold, None]
+    assert impossible.any() and np.all(calibrated[impossible] == 1.0)
+    assert ev.integrated_brier(time[hold], event[hold], calibrated, TIMES) < ev.integrated_brier(
+        time[hold], event[hold], raw[hold], TIMES
+    )
+
+
+def test_km_by_group_uses_group_curves_and_falls_back_to_the_pooled_one():
+    time = np.array([1.0, 2.0, 2.0, 3.0])
+    event = np.array([True, True, False, True])
+    groups = np.array([5, 5, 7, 7])
+    times = np.array([1, 2, 3])
+    curves = ev.km_by_group(time, event, groups, np.array([7, 5, 9]), times)
+    np.testing.assert_allclose(
+        curves,
+        [
+            [1.0, 1.0, 0.0],  # group 7: censored on day 2, churn on day 3
+            [0.5, 0.0, 0.0],  # group 5: churn on days 1 and 2
+            ev.km_on_grid(time, event, times),  # unseen group: everybody
+        ],
+    )
+
+
+def test_stratified_metrics_match_metrics_of_each_stratum(sample):
+    time, event, surv = sample["time"], sample["event"], sample["true"]
+    values = np.arange(len(time)) % 10 + 1
+    table = ev.stratified_metrics(time, event, surv, TIMES, HORIZON, values, [(1, 3), (4, 10)])
+
+    assert table["stratum"].tolist() == ["1-3", "4-10"]
+    assert table["n"].tolist() == [1200, 2800]
+    low = values <= 3
+    expected = ev.summary_metrics(time[low], event[low], surv[low], TIMES, HORIZON)
+    for metric, value in expected.items():
+        assert table.loc[0, metric] == pytest.approx(value)
+    assert table.loc[0, "churn_rate_horizon"] == pytest.approx(
+        (event[low] & (time[low] <= HORIZON)).mean()
+    )
+
+
+def test_bootstrap_mean_ibs_resamples_clusters_across_folds(sample):
+    time, event = sample["time"][:1200], sample["event"][:1200]
+    surv = {"a": sample["true"][:1200], "b": sample["true"][:1200], "km": sample["km"][:1200]}
+    # Two folds of 600 rows; the first 300 clusters are present in both.
+    cluster = np.concatenate([np.arange(600), np.arange(300), np.arange(600, 900)])
+    folds = [
+        ev.Fold(cluster[rows], time[rows], event[rows], {k: s[rows] for k, s in surv.items()})
+        for rows in (slice(0, 600), slice(600, 1200))
+    ]
+    draws = ev.bootstrap_mean_ibs(folds, TIMES, n_boot=20, seed=1)
+
+    assert draws.columns.tolist() == ["draw", "model", "metric", "value"]
+    assert len(draws) == 20 * len(surv) and set(draws["metric"]) == {"ibs"}
+    point = np.mean(
+        [ev.integrated_brier(f.time, f.event, f.surv_by_model["a"], TIMES) for f in folds]
+    )
+    summary = ev.bootstrap_summary(draws).set_index("model")
+    assert summary.loc["a", "ci_low"] <= point <= summary.loc["a", "ci_high"]
+    same = ev.bootstrap_difference(draws, "a", "b")
+    assert (same[["mean", "ci_low", "ci_high"]] == 0).all().all()
+    assert ev.bootstrap_difference(draws, "km", "a")["ci_low"].iloc[0] > 0
+
+    # A cluster is drawn as a whole: with one cluster per fold a draw can only
+    # return the fold as it is, so the criterion does not vary.
+    whole = [fold._replace(cluster=np.zeros(600, dtype=int)) for fold in folds]
+    values = ev.bootstrap_mean_ibs(whole, TIMES, n_boot=5, seed=1).query("model == 'a'")["value"]
+    np.testing.assert_allclose(values, point)
+
+
 def test_bootstrap_summary_and_paired_difference(sample):
     time, event = sample["time"][:800], sample["event"][:800]
     surv = {"a": sample["true"][:800], "b": sample["true"][:800], "km": sample["km"][:800]}

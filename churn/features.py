@@ -124,7 +124,9 @@ def snapshot_features(
     Returns
     -------
     pd.DataFrame
-        ``player_id``, ``snapshot_date``, the columns in ``config.FEATURES`` and
+        ``player_id``, ``snapshot_date``, the columns in ``config.FEATURES``,
+        ``config.DELAY_COLUMN`` (days after the snapshot during which the player
+        cannot churn yet; the time origin of the models, not a feature) and
         ``churn_date`` (label information, not a feature).
     """
     history = activity[activity["date"] < snapshot]
@@ -144,6 +146,7 @@ def snapshot_features(
     frame["snapshot_date"] = snapshot
     frame["tenure_days"] = (snapshot - static["registration_date"]).dt.days
     frame["recency_days"] = (snapshot - last_active.reindex(at_risk)).dt.days
+    frame[config.DELAY_COLUMN] = config.INACTIVITY_DAYS - frame["recency_days"]
     frame["active_days_7d"] = active_7d.reindex(at_risk, fill_value=0)
     frame["active_days_30d"] = active_30d.reindex(at_risk)
     frame["activity_ratio_7d_30d"] = (frame["active_days_7d"] / 7) / (
@@ -157,7 +160,8 @@ def snapshot_features(
         frame[name] = pd.Categorical(static[name], categories=list(categories))
     frame["churn_date"] = churn_dates.reindex(at_risk)
     frame = frame.rename_axis("player_id").reset_index()
-    return frame[["player_id", "snapshot_date", *config.FEATURES, "churn_date"]]
+    columns = ["player_id", "snapshot_date", *config.FEATURES, config.DELAY_COLUMN, "churn_date"]
+    return frame[columns]
 
 
 def build_snapshots(

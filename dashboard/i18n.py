@@ -36,7 +36,7 @@ TEXT: dict[str, tuple[str, str]] = {
     "section_risk": ("Riskiest players and scoring", "Самые рисковые игроки и скоринг"),
     # --- Overview -------------------------------------------------------------
     "kpi_best_model": ("Best model", "Лучшая модель"),
-    "kpi_test_ibs": ("Test IBS (calibrated)", "IBS на тесте (калибр.)"),
+    "kpi_test_ibs": ("Test IBS ({variant})", "IBS на тесте ({variant})"),
     "kpi_test_auc": ("Test AUC at horizon", "AUC на тесте на горизонте"),
     "kpi_churn_rate": ("Observed churn rate, test", "Фактический отток, тест"),
     "kpi_high_risk": ("High-risk players", "Игроки высокого риска"),
@@ -47,22 +47,28 @@ TEXT: dict[str, tuple[str, str]] = {
         "is the number of days until churn, censored after {follow_up} days. Two survival "
         "models, XGBoost Cox and XGBoost AFT, predict the whole curve `S(t | x)` for days "
         "1..{grid_end}; the business score is `P(churn within {horizon} days) = 1 - S({horizon})`. "
-        "The data are synthetic.",
+        "A player last active `r` days before the snapshot cannot churn during the first "
+        "`{inactivity} - r` days, so the models count time from the end of that period and "
+        "predict `S = 1` before it. The data are synthetic.",
         "**Постановка.** Игрок считается ушедшим в день, когда завершается первая серия из "
         "{inactivity} дней подряд без активности. Каждая строка — игрок, который ещё находится "
         "под риском на дату ежемесячного среза; признаки используют только историю до этой "
         "даты, а таргет — число дней до оттока с цензурированием после {follow_up} дней. Две "
         "survival-модели, XGBoost Cox и XGBoost AFT, прогнозируют всю кривую `S(t | x)` для дней "
         "1..{grid_end}; бизнес-скор — `P(отток за {horizon} дней) = 1 - S({horizon})`. "
-        "Данные синтетические.",
+        "Игрок, последний раз активный за `r` дней до среза, не может уйти в первые "
+        "`{inactivity} - r` дней, поэтому модели отсчитывают время от конца этого периода, "
+        "а до него дают `S = 1`. Данные синтетические.",
     ),
     "datasets": ("Datasets", "Выборки"),
     "tuning": ("Hyperparameter tuning", "Тюнинг гиперпараметров"),
     "tuning_note": (
-        "Optuna (TPE), {n_trials} trials per model, objective: integrated Brier score on the "
-        "validation snapshot.",
-        "Optuna (TPE), {n_trials} испытаний на модель, целевая метрика — integrated Brier score "
-        "на валидационном срезе.",
+        "Optuna (TPE), {n_trials} trials per model, objective: integrated Brier score averaged "
+        "over the rolling-origin folds {folds}. On each fold the model is fitted on the earlier "
+        "snapshots with the labels known on the fold date.",
+        "Optuna (TPE), {n_trials} испытаний на модель, целевая метрика — integrated Brier score, "
+        "усреднённый по фолдам со скользящим началом {folds}. На каждом фолде модель обучается "
+        "на более ранних срезах с метками, известными на дату фолда.",
     ),
     "hyperparameter": ("Hyperparameter", "Гиперпараметр"),
     "trial": ("Trial", "Испытание"),
@@ -70,19 +76,54 @@ TEXT: dict[str, tuple[str, str]] = {
     "best_so_far": ("best so far", "лучшее на текущий момент"),
     # --- Quality --------------------------------------------------------------
     "best_model_text": (
-        "Best model: **{model}**, chosen by the validation IBS of the uncalibrated models "
-        "(Cox {cox:.5f}, AFT {aft:.5f}). The test set is used for reporting only.",
-        "Лучшая модель: **{model}**, выбрана по IBS некалиброванных моделей на валидации "
-        "(Cox {cox:.5f}, AFT {aft:.5f}). Тестовая выборка используется только для отчёта.",
+        "Selected: **{model}, {variant}**. The criterion is the integrated Brier score averaged "
+        "over the selection folds ({folds}), each forecast the way production works: models "
+        "refitted on all earlier snapshots, calibrator taken from the latest earlier model "
+        "whose snapshot has full follow-up. A family is calibrated only if the 95% interval of "
+        "the calibration effect lies below zero; the family with the lower criterion wins. "
+        "The test snapshot is used for reporting only.",
+        "Выбрана: **{model}, {variant}**. Критерий — integrated Brier score, усреднённый по "
+        "фолдам выбора ({folds}); каждый фолд спрогнозирован так же, как работает production: "
+        "модели переобучены на всех более ранних срезах, калибратор взят от последней более "
+        "ранней модели, чей срез прослежен полностью. Семейство калибруется, только если 95% "
+        "интервал эффекта калибровки целиком ниже нуля; побеждает семейство с меньшим "
+        "критерием. Тестовый срез используется только для отчёта.",
     ),
+    "selection_title": ("Model selection", "Выбор модели"),
+    "selection_note": (
+        "Intervals come from {n_boot} bootstrap resamples of players, not rows: a player is "
+        "at risk on several folds. The last row tells whether the folds can tell the selected "
+        "candidate from the runner-up.",
+        "Интервалы получены по {n_boot} бутстрап-выборкам игроков, а не строк: один игрок "
+        "находится под риском на нескольких фолдах. Последняя строка показывает, различают ли "
+        "фолды выбранного кандидата и следующего за ним.",
+    ),
+    "quality_title": ("Quality on validation and test", "Качество на валидации и тесте"),
     "quality_note": (
         "IBS is integrated over the daily grid; Brier score and AUC are taken at day {horizon}; "
         "the C-index ranks players by the predicted churn probability at day {horizon}. "
-        "Kaplan-Meier is a reference without covariates (the training survival curve applied "
-        "to everybody).",
+        "Two references use no model. Kaplan-Meier is the training survival curve applied to "
+        "everybody. Kaplan-Meier by recency is one training curve per number of days since the "
+        "last activity: what the churn definition alone gives, and the bar a model has to clear.",
         "IBS интегрируется по дневной сетке; Brier score и AUC считаются на {horizon}-й день; "
         "C-index ранжирует игроков по прогнозной вероятности оттока на {horizon}-й день. "
-        "Каплан–Мейер — ориентир без признаков (кривая обучающей выборки для всех игроков).",
+        "Два ориентира обходятся без модели. Каплан–Мейер — кривая обучающей выборки для всех "
+        "игроков. Каплан–Мейер по давности — своя кривая обучающей выборки для каждого числа "
+        "дней с последней активности: то, что даёт одно только определение оттока, и планка, "
+        "которую модель должна превзойти.",
+    ),
+    "strata_title": ("Test quality by recency", "Качество на тесте по давности активности"),
+    "strata_note": (
+        "Players inactive for a long time churn almost surely and dominate the pooled metrics, "
+        "so the same metrics are shown within groups of days since the last activity. Recently "
+        "active players are the ones that can still be retained. Within a group the integrated "
+        "Brier score covers only the days that the group's follow-up supports, so compare "
+        "models within a group, not groups with each other.",
+        "Давно неактивные игроки уходят почти наверняка и определяют общие метрики, поэтому "
+        "те же метрики показаны внутри групп по числу дней с последней активности. Недавно "
+        "активные игроки — те, кого ещё можно удержать. Внутри группы integrated Brier score "
+        "покрывает только дни, обеспеченные наблюдением этой группы, поэтому сравнивайте "
+        "модели внутри группы, а не группы между собой.",
     ),
     "metric": ("Metric", "Метрика"),
     "model_variant": ("Model", "Модель"),
@@ -136,10 +177,12 @@ TEXT: dict[str, tuple[str, str]] = {
         "Each model is recalibrated with one isotonic regression per day of the grid "
         "(1..{grid_end}), fitted on the validation snapshot and applied to the test snapshot. "
         "Points are deciles of the predicted probability; the dashed diagonal is perfect "
-        "calibration.",
+        "calibration. Whether the scores use the calibrated curves is decided on the selection "
+        "folds, not here.",
         "Каждая модель перекалибрована изотонической регрессией для каждого дня сетки "
         "(1..{grid_end}): обучение на валидационном срезе, применение на тестовом. "
-        "Точки — децили прогнозной вероятности; пунктирная диагональ — идеальная калибровка.",
+        "Точки — децили прогнозной вероятности; пунктирная диагональ — идеальная калибровка. "
+        "Использовать ли калиброванные кривые в скоринге, решается на фолдах выбора, а не здесь.",
     ),
     "predicted_churn_rate": ("Predicted churn rate", "Прогнозная доля оттока"),
     "observed_churn_rate": ("Observed churn rate", "Фактическая доля оттока"),
@@ -164,10 +207,14 @@ TEXT: dict[str, tuple[str, str]] = {
     "importance_note": (
         "Shares within each model, so that Cox (log hazard) and AFT (log time) are comparable. "
         "SHAP values of the evaluation models are computed on the test snapshot, those of the "
-        "production model on the scoring snapshot.",
+        "production model on the scoring snapshot. Importance describes the time left once "
+        "churn is possible; the churn-free period that recency fixes by definition is not "
+        "learned and has no importance.",
         "Доли внутри каждой модели, чтобы Cox (лог-hazard) и AFT (лог-время) были сопоставимы. "
         "SHAP-значения evaluation-моделей посчитаны на тестовом срезе, production-модели — "
-        "на срезе скоринга.",
+        "на срезе скоринга. Важность описывает время после того, как отток стал возможен; "
+        "период без оттока, который давность задаёт по определению, не обучается и важности "
+        "не имеет.",
     ),
     "importance_type": ("Importance type", "Тип важности"),
     "importance_share": ("Share of total importance", "Доля суммарной важности"),
@@ -197,10 +244,10 @@ TEXT: dict[str, tuple[str, str]] = {
     # --- RUL ------------------------------------------------------------------
     "rul_note": (
         "Remaining useful life = expected days until churn, restricted to {days} days, from "
-        "the calibrated {model} curves on the test snapshot. Kaplan-Meier gives one number for "
+        "the {model} curves ({variant}) on the test snapshot. Kaplan-Meier gives one number for "
         "everybody; the model gives one per player.",
         "Остаточный срок жизни — ожидаемое число дней до оттока, ограниченное {days} днями, "
-        "по калиброванным кривым модели {model} на тестовом срезе. Каплан–Мейер даёт одно "
+        "по кривым модели {model} ({variant}) на тестовом срезе. Каплан–Мейер даёт одно "
         "число на всех; модель — своё для каждого игрока.",
     ),
     "rul_mean_predicted": ("Mean predicted RUL, days", "Средний прогнозный RUL, дней"),
@@ -226,24 +273,40 @@ TEXT: dict[str, tuple[str, str]] = {
     "backtest_note": (
         "Rolling origin: for every date the models are refitted on all earlier snapshots with "
         "the labels known on that date, then predict the {horizon}-day churn of the players at "
-        "risk on that date. Hyperparameters come from the main tuning run; predictions are "
-        "uncalibrated.",
+        "risk on that date. The calibrated variant uses the calibrator of the model fitted "
+        "{lag} earlier, the latest one whose snapshot has full follow-up: exactly what the "
+        "scoring of the current players does. The role column says what the main run uses a "
+        "date for. Hyperparameters are tuned on the tuning folds and the family is chosen on "
+        "the selection folds, so only the test date and the dates after it are untouched by "
+        "every decision.",
         "Скользящее начало: для каждой даты модели переобучаются на всех более ранних срезах "
         "с метками, известными на эту дату, и прогнозируют отток за {horizon} дней для игроков "
-        "под риском на эту дату. Гиперпараметры взяты из основного тюнинга; прогнозы не "
-        "калиброваны.",
+        "под риском на эту дату. Калиброванный вариант использует калибратор модели, обученной "
+        "на {lag} раньше, — последней, чей срез прослежен полностью: именно так скорятся текущие "
+        "игроки. Столбец роли показывает, для чего дата используется в основном запуске. "
+        "Гиперпараметры подобраны на фолдах тюнинга, а семейство выбрано на фолдах выбора, "
+        "поэтому ни одно решение не затрагивает только тестовую дату и даты после неё.",
     ),
+    "calibration_lag": ("{months} months", "{months} мес."),
     "snapshot_date": ("Snapshot date", "Дата среза"),
     # --- Production -----------------------------------------------------------
     "production_note": (
-        "The production model is the best configuration ({model}) refitted on train + "
-        "validation ({prod_rows:,} rows instead of {eval_rows:,}) and reuses the calibrator "
-        "of the evaluation model. Both are compared on the test snapshot ({test}), which "
-        "neither has seen.",
-        "Production-модель — лучшая конфигурация ({model}), переобученная на train + "
-        "validation ({prod_rows:,} строк вместо {eval_rows:,}); калибратор взят от "
-        "evaluation-модели. Обе сравниваются на тестовом срезе ({test}), которого ни одна "
-        "из них не видела.",
+        "The production model is the selected family ({model}) refitted on every snapshot "
+        "before the scoring date {scoring} with the labels known that day ({prod_rows:,} rows). "
+        "Its calibrator belongs to the model fitted as of {calibration}, the latest one whose "
+        "snapshot has full follow-up. It scores players whose outcomes are still unknown, so "
+        "it cannot be tested itself. The comparison below replays the same procedure on the "
+        "test date {test}: the rows named production are the model refitted on every snapshot "
+        "before {test}, the rows named evaluation are the model frozen on {val} "
+        "({eval_rows:,} rows); both use the calibrator fitted on the {val} snapshot.",
+        "Production-модель — выбранное семейство ({model}), переобученное на всех срезах до "
+        "даты скоринга {scoring} с метками, известными на этот день ({prod_rows:,} строк). "
+        "Её калибратор принадлежит модели, обученной по состоянию на {calibration}, — последней, "
+        "чей срез прослежен полностью. Она скорит игроков, исходы которых ещё неизвестны, "
+        "поэтому саму её проверить нельзя. Сравнение ниже воспроизводит ту же процедуру на "
+        "тестовую дату {test}: строки production — модель, переобученная на всех срезах до "
+        "{test}, строки evaluation — модель, замороженная на {val} ({eval_rows:,} строк); "
+        "обе используют калибратор, обученный на срезе {val}.",
     ),
     "agreement_rank": (
         "Spearman correlation of risk scores",
@@ -254,17 +317,19 @@ TEXT: dict[str, tuple[str, str]] = {
         "Среднее абсолютное расхождение вероятности оттока",
     ),
     "score_agreement_title": (
-        "Calibrated {horizon}-day churn probability",
-        "Калиброванная вероятность оттока за {horizon} дней",
+        "{horizon}-day churn probability ({variant})",
+        "Вероятность оттока за {horizon} дней ({variant})",
     ),
     # --- Risk -----------------------------------------------------------------
     "risk_note": (
-        "Players at risk on {date}, scored by the calibrated production model. Players close "
+        "Players at risk on {date}, scored by the production model ({variant}). Players close "
         "to {inactivity} days of inactivity are almost certain to churn by definition; lower "
-        "the recency filter to focus on players who can still be retained.",
-        "Игроки под риском на {date}, оценённые калиброванной production-моделью. Игроки, "
+        "the recency filter to focus on players who can still be retained. A probability is "
+        "exactly zero for as long as the player cannot complete {inactivity} inactive days.",
+        "Игроки под риском на {date}, оценённые production-моделью ({variant}). Игроки, "
         "близкие к {inactivity} дням неактивности, почти наверняка уйдут по определению; "
-        "уменьшите фильтр давности, чтобы сосредоточиться на тех, кого ещё можно удержать.",
+        "уменьшите фильтр давности, чтобы сосредоточиться на тех, кого ещё можно удержать. "
+        "Вероятность равна нулю, пока игрок не может набрать {inactivity} дней неактивности.",
     ),
     "risk_segment": ("Risk segment", "Сегмент риска"),
     "players": ("Players", "Игроки"),
@@ -294,6 +359,7 @@ TEXT: dict[str, tuple[str, str]] = {
     "cox": ("XGBoost Cox", "XGBoost Cox"),
     "aft": ("XGBoost AFT", "XGBoost AFT"),
     "kaplan_meier": ("Kaplan-Meier", "Каплан–Мейер"),
+    "km_recency": ("Kaplan-Meier by recency", "Каплан–Мейер по давности"),
     "evaluation": ("Evaluation model", "Evaluation-модель"),
     "production": ("Production model", "Production-модель"),
     "raw": ("raw", "без калибровки"),
@@ -301,8 +367,12 @@ TEXT: dict[str, tuple[str, str]] = {
     "train": ("Train", "Train"),
     "val": ("Validation", "Validation"),
     "test": ("Test", "Test"),
-    "production_train": ("Production train (train + val)", "Production train (train + val)"),
+    "production_train": ("Production train", "Production train"),
     "scoring": ("Scoring", "Скоринг"),
+    "tune": ("Tuning fold", "Фолд тюнинга"),
+    "selection": ("Selection fold", "Фолд выбора"),
+    "later": ("After test", "После теста"),
+    "other": ("Not a decision fold", "Вне решений"),
     "all": ("All players", "Все игроки"),
     "low": ("Low risk", "Низкий риск"),
     "medium": ("Medium risk", "Средний риск"),
@@ -314,8 +384,12 @@ TEXT: dict[str, tuple[str, str]] = {
     "c_index": ("C-index", "C-index"),
     "brier": ("Brier score", "Brier score"),
     "auc": ("AUC", "AUC"),
+    "ibs_horizon": ("IBS up to horizon", "IBS до горизонта"),
     "split": ("Split", "Выборка"),
     "variant": ("Variant", "Вариант"),
+    "role": ("Role of the date", "Роль даты"),
+    "stratum": ("Days since last activity", "Дней с последней активности"),
+    "selected": ("Selected", "Выбрана"),
     "snapshot_dates": ("Snapshot dates", "Даты срезов"),
     "rows": ("Rows", "Строки"),
     "event_rate": ("Event rate", "Доля событий"),

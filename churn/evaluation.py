@@ -9,7 +9,8 @@ sample itself: training rows are censored by the calendar cutoff, which is not
 how the evaluation snapshots are censored.
 """
 
-from typing import Self
+from collections.abc import Sequence
+from typing import NamedTuple, Self
 
 import numpy as np
 import pandas as pd
@@ -142,6 +143,62 @@ def summary_metrics(
         "brier_horizon": float(brier_score(y, y, surv[:, [k]], horizon)[1][0]),
         "auc_horizon": float(cumulative_dynamic_auc(y, y, risk, horizon)[0][0]),
     }
+
+
+def stratified_metrics(
+    time: np.ndarray,
+    event: np.ndarray,
+    surv: np.ndarray,
+    times: np.ndarray,
+    horizon: float,
+    values: np.ndarray,
+    strata: Sequence[tuple[float, float]],
+) -> pd.DataFrame:
+    """:func:`summary_metrics` within strata of one variable.
+
+    The integrated Brier score of a stratum covers only the grid points inside
+    the follow-up of that stratum, so it compares models within a stratum, not
+    strata with each other.
+
+    Parameters
+    ----------
+    time, event : np.ndarray
+        Observed durations and boolean event indicators.
+    surv : np.ndarray
+        Predicted survival probabilities, shape ``(n_samples, len(times))``.
+    times : np.ndarray
+        Increasing time grid.
+    horizon : float
+        Horizon passed to :func:`summary_metrics`.
+    values : np.ndarray
+        Stratification variable, one value per sample.
+    strata : sequence of (low, high)
+        Inclusive bounds of each stratum.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per stratum: ``stratum`` (``"<low>-<high>"``), ``n``,
+        ``churn_rate_horizon`` and the metrics in ``METRICS``.
+
+    Raises
+    ------
+    ValueError
+        If a sample is censored before ``horizon``.
+    """
+    require_follow_up(time, event, horizon)
+    rows = []
+    for low, high in strata:
+        inside = (values >= low) & (values <= high)
+        rows.append(
+            {
+                "stratum": f"{low}-{high}",
+                "n": int(inside.sum()),
+                "churn_rate_horizon": float((event[inside] & (time[inside] <= horizon)).mean()),
+                **summary_metrics(time[inside], event[inside], surv[inside], times, horizon),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def horizon_metrics(
@@ -334,11 +391,100 @@ def bootstrap_difference(
     return bootstrap_summary(difference, level)
 
 
+class Fold(NamedTuple):
+    """One evaluation sample with the survival curves of several models."""
+
+    cluster: np.ndarray  # resampling unit of each row, e.g. the player id
+    time: np.ndarray
+    event: np.ndarray
+    surv_by_model: dict[str, np.ndarray]
+
+
+def bootstrap_mean_ibs(
+    folds: Sequence[Fold], times: np.ndarray, n_boot: int = 200, seed: int = 0
+) -> pd.DataFrame:
+    """Cluster bootstrap of the integrated Brier score averaged over folds.
+
+    Clusters are resampled with replacement and every fold keeps the rows of
+    the drawn clusters, so rows of one cluster (a player seen on several
+    snapshots) stay together. The same resample is used for every model, which
+    makes differences between models paired.
+
+    Parameters
+    ----------
+    folds : sequence of Fold
+        Evaluation samples; every fold holds the same model names.
+    times : np.ndarray
+        Time grid of the survival matrices.
+    n_boot : int
+        Number of bootstrap resamples.
+    seed : int
+        Seed of the resampling.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long frame with columns ``draw``, ``model``, ``metric`` (always
+        ``"ibs"``) and ``value``, the layout :func:`bootstrap_summary` and
+        :func:`bootstrap_difference` take.
+    """
+    clusters = np.unique(np.concatenate([fold.cluster for fold in folds]))
+    positions = [np.searchsorted(clusters, fold.cluster) for fold in folds]
+    rng = np.random.default_rng(seed)
+    rows = []
+    for draw in range(n_boot):
+        drawn = rng.integers(0, clusters.size, clusters.size)
+        copies = np.bincount(drawn, minlength=clusters.size)
+        totals = dict.fromkeys(folds[0].surv_by_model, 0.0)
+        for fold, position in zip(folds, positions, strict=True):
+            idx = np.repeat(np.arange(len(fold.time)), copies[position])
+            for model, surv in fold.surv_by_model.items():
+                totals[model] += integrated_brier(fold.time[idx], fold.event[idx], surv[idx], times)
+        rows += [(draw, model, "ibs", total / len(folds)) for model, total in totals.items()]
+    return pd.DataFrame(rows, columns=["draw", "model", "metric", "value"])
+
+
 def km_on_grid(time: np.ndarray, event: np.ndarray, times: np.ndarray) -> np.ndarray:
     """Kaplan-Meier survival estimate evaluated at ``times``."""
     km_times, km_surv = kaplan_meier_estimator(event, time)
     index = np.searchsorted(km_times, times, side="right")
     return np.concatenate([[1.0], km_surv])[index]
+
+
+def km_by_group(
+    time: np.ndarray,
+    event: np.ndarray,
+    groups: np.ndarray,
+    new_groups: np.ndarray,
+    times: np.ndarray,
+) -> np.ndarray:
+    """Kaplan-Meier curve of each group, handed to new samples by their group.
+
+    A reference that knows one grouping variable and nothing else. Groups absent
+    from the reference sample get the pooled Kaplan-Meier curve.
+
+    Parameters
+    ----------
+    time, event : np.ndarray
+        Observed durations and boolean event indicators of the reference sample.
+    groups : np.ndarray
+        Group of each reference sample.
+    new_groups : np.ndarray
+        Group of each sample to predict for.
+    times : np.ndarray
+        Time grid.
+
+    Returns
+    -------
+    np.ndarray
+        Survival probabilities, shape ``(len(new_groups), len(times))``.
+    """
+    pooled = km_on_grid(time, event, times)
+    curves = {
+        group: km_on_grid(time[groups == group], event[groups == group], times)
+        for group in np.unique(groups)
+    }
+    return np.vstack([curves.get(group, pooled) for group in new_groups])
 
 
 def survival_curve_table(

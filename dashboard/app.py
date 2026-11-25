@@ -21,6 +21,7 @@ COLORS = {
     "aft": "#f97316",
     "production": "#16a34a",
     "kaplan_meier": "#9ca3af",
+    "km_recency": "#a855f7",
     "all": GREY,
     "low": "#16a34a",
     "medium": "#f59e0b",
@@ -128,13 +129,13 @@ def plot_positions(values: pd.Series) -> tuple[np.ndarray, list[str] | None]:
 
 
 def render_overview(t: Translator, metrics: dict) -> None:
-    best = metrics["best_model"]
+    best, variant = metrics["best_model"], metrics["best_variant"]
     quality, scores = table("model_quality"), table("scores")
-    row = quality.query("split == 'test' and model == @best and variant == 'calibrated'").iloc[0]
+    row = quality.query("split == 'test' and model == @best and variant == @variant").iloc[0]
     high_risk = (scores["risk_segment"] == "high").sum()
     kpis = st.columns(5)
     kpis[0].metric(t("kpi_best_model"), t.label(best))
-    kpis[1].metric(t("kpi_test_ibs"), f"{row['ibs']:.4f}")
+    kpis[1].metric(t("kpi_test_ibs", variant=t.label(variant)), f"{row['ibs']:.4f}")
     kpis[2].metric(t("kpi_test_auc"), f"{row['auc_horizon']:.3f}")
     kpis[3].metric(t("kpi_churn_rate"), f"{metrics['datasets']['test']['churn_rate_horizon']:.1%}")
     kpis[4].metric(t("kpi_high_risk"), f"{high_risk:,} / {len(scores):,}")
@@ -154,7 +155,7 @@ def render_overview(t: Translator, metrics: dict) -> None:
         "train": " .. ".join(snapshots["train"]),
         "val": snapshots["val"],
         "test": snapshots["test"],
-        "production_train": f"{snapshots['train'][0]} .. {snapshots['val']}",
+        "production_train": " .. ".join(snapshots["production_train"]),
         "scoring": snapshots["scoring"],
     }
     datasets = pd.DataFrame(
@@ -167,7 +168,8 @@ def render_overview(t: Translator, metrics: dict) -> None:
     show_table(t, datasets, percent=("event_rate", "churn_rate_horizon"))
 
     st.subheader(t("tuning"))
-    st.caption(t("tuning_note", n_trials=metrics["tuning"]["n_trials"]))
+    folds = ", ".join(snapshots["tune"])
+    st.caption(t("tuning_note", n_trials=metrics["tuning"]["n_trials"], folds=folds))
     left, right = st.columns([2, 3])
     params = pd.DataFrame(metrics["tuning"]["best_params"]).map(
         lambda v: "—" if pd.isna(v) else f"{v:.4g}" if isinstance(v, float) else str(v)
@@ -194,10 +196,24 @@ def render_overview(t: Translator, metrics: dict) -> None:
 
 
 def render_quality(t: Translator, metrics: dict) -> None:
-    quality = table("model_quality")
-    val_ibs = metrics["tuning"]["val_ibs"]
-    best = t.label(metrics["best_model"])
-    st.success(t("best_model_text", model=best, cox=val_ibs["cox"], aft=val_ibs["aft"]))
+    quality, selection = table("model_quality"), metrics["selection"]
+    st.success(
+        t(
+            "best_model_text",
+            model=t.label(selection["best_model"]),
+            variant=t.label(selection["best_variant"]),
+            folds=", ".join(metrics["snapshots"]["selection"]),
+        )
+    )
+    st.subheader(t("selection_title"))
+    candidates = table("selection")
+    show_table(t, candidates.assign(selected=np.where(candidates["selected"], t("yes"), t("no"))))
+    effects = [*selection["calibration_effect"].values(), selection["best_vs_runner_up"]]
+    differences = pd.DataFrame(effects).rename(columns={"pair": "model"})
+    show_differences(t, differences[["model", "point", "ci_low", "ci_high"]])
+    st.caption(t("selection_note", n_boot=selection["n_bootstrap"]))
+
+    st.subheader(t("quality_title"))
     show_table(t, quality)
     st.caption(t("quality_note", horizon=metrics["horizon_days"]))
 
@@ -212,6 +228,10 @@ def render_quality(t: Translator, metrics: dict) -> None:
         )
     )
     show_chart(fig, "", t.label(metric), height=360)
+
+    st.subheader(t("strata_title"))
+    st.caption(t("strata_note"))
+    show_table(t, table("quality_by_recency"), percent=("churn_rate_horizon",))
 
 
 def render_pred_obs(t: Translator, metrics: dict) -> None:
@@ -231,7 +251,7 @@ def render_pred_obs(t: Translator, metrics: dict) -> None:
     left, right = st.columns(2)
     with left:
         model, variant = pick_variant(
-            t, calibration, "pred_obs_variant", (metrics["best_model"], "calibrated")
+            t, calibration, "pred_obs_variant", (metrics["best_model"], metrics["best_variant"])
         )
     horizons = sorted(calibration["horizon"].unique())
     horizon = right.selectbox(t("horizon"), horizons, index=len(horizons) - 1, key="pred_obs_h")
@@ -255,7 +275,7 @@ def render_hazard(t: Translator, metrics: dict) -> None:
     left, middle, right = st.columns([2, 2, 1])
     with left:
         model, variant = pick_variant(
-            t, hazard, "hazard_variant", (metrics["best_model"], "calibrated")
+            t, hazard, "hazard_variant", (metrics["best_model"], metrics["best_variant"])
         )
     groups = middle.multiselect(
         t("risk_groups"),
@@ -315,10 +335,12 @@ def render_calibration(t: Translator, metrics: dict) -> None:
     show_chart(fig, None, t("observed_churn_rate"), yaxis_tickformat=".0%")
 
     st.subheader(t("calibration_effect"))
-    quality = table("model_quality").query("split == 'test' and model != 'kaplan_meier'")
+    quality = table("model_quality")
+    quality = quality[(quality["split"] == "test") & quality["model"].isin(models)]
     show_table(t, quality.drop(columns="split"))
     differences = table("bootstrap_differences")
-    show_differences(t, differences[differences["model"].str.contains("calibrated - .*raw")])
+    own = [f"{model}_calibrated - {model}_raw" for model in models]
+    show_differences(t, differences[differences["model"].isin(own)])
 
 
 def render_bootstrap(t: Translator, metrics: dict) -> None:
@@ -444,7 +466,8 @@ def render_dependence(t: Translator, metrics: dict) -> None:
 def render_rul(t: Translator, metrics: dict) -> None:
     rul, summary, best = table("rul"), metrics["rul"], metrics["best_model"]
     days = int(summary["restricted_to_days"])
-    st.caption(t("rul_note", model=t.label(best), days=days))
+    variant = t.label(metrics["best_variant"])
+    st.caption(t("rul_note", model=t.label(best), variant=variant, days=days))
     kpis = st.columns(4)
     kpis[0].metric(t("rul_mean_predicted"), f"{summary['mean_predicted']:.1f}")
     kpis[1].metric(t("rul_mean_observed"), f"{summary['mean_observed']:.1f}")
@@ -470,21 +493,25 @@ def render_rul(t: Translator, metrics: dict) -> None:
 
 def render_backtest(t: Translator, metrics: dict) -> None:
     backtest, horizon = table("backtest"), metrics["horizon_days"]
-    st.caption(t("backtest_note", horizon=horizon))
+    lag = t("calibration_lag", months=metrics["calibration_lag_months"])
+    st.caption(t("backtest_note", horizon=horizon, lag=lag))
     observed = backtest.drop_duplicates("snapshot_date")
     fig = go.Figure()
     add_line(
         fig, observed["snapshot_date"], observed["observed_rate"], t("observed"), GREY, width=5
     )
-    for model, part in backtest.groupby("model", sort=False):
-        name = f"{t.label(model)} · {t('predicted')}"
-        add_line(fig, part["snapshot_date"], part["predicted_rate"], name, COLORS[model])
+    series = [
+        (series_name(t, model, variant), COLORS[model], DASHES[variant], part)
+        for (model, variant), part in backtest.groupby(["model", "variant"], sort=False)
+    ]
+    for name, color, dash, part in series:
+        add_line(fig, part["snapshot_date"], part["predicted_rate"], name, color, dash)
     y_title = t("churn_rate_by", horizon=horizon)
     show_chart(fig, t("snapshot_date"), y_title, yaxis_tickformat=".0%", yaxis_rangemode="tozero")
-    for column, metric in zip(st.columns(2), ("auc", "brier"), strict=True):
+    for column, metric in zip(st.columns(3), ("auc", "brier", "ibs_horizon"), strict=True):
         fig = go.Figure()
-        for model, part in backtest.groupby("model", sort=False):
-            add_line(fig, part["snapshot_date"], part[metric], t.label(model), COLORS[model])
+        for name, color, dash, part in series:
+            add_line(fig, part["snapshot_date"], part[metric], name, color, dash)
         with column:
             show_chart(fig, t("snapshot_date"), t.label(metric), height=320)
     show_table(t, backtest, percent=("predicted_rate", "observed_rate"))
@@ -492,14 +519,18 @@ def render_backtest(t: Translator, metrics: dict) -> None:
 
 def render_production(t: Translator, metrics: dict) -> None:
     datasets, agreement = metrics["datasets"], metrics["eval_vs_production_agreement"]
-    best, horizon = metrics["best_model"], metrics["horizon_days"]
+    best, variant, horizon = metrics["best_model"], metrics["best_variant"], metrics["horizon_days"]
+    snapshots = metrics["snapshots"]
     st.caption(
         t(
             "production_note",
             model=t.label(best),
             eval_rows=datasets["train"]["rows"],
             prod_rows=datasets["production_train"]["rows"],
-            test=metrics["snapshots"]["test"],
+            scoring=snapshots["scoring"],
+            calibration=snapshots["production_calibration"],
+            val=snapshots["val"],
+            test=snapshots["test"],
         )
     )
     kpis = st.columns(2)
@@ -522,8 +553,8 @@ def render_production(t: Translator, metrics: dict) -> None:
 
     scores = table("eval_vs_production_scores")
     points = go.Scattergl(
-        x=scores["evaluation_calibrated"],
-        y=scores["production_calibrated"],
+        x=scores[f"evaluation_{variant}"],
+        y=scores[f"production_{variant}"],
         mode="markers",
         marker={"size": 4, "opacity": 0.4, "color": COLORS["production"]},
         showlegend=False,
@@ -531,7 +562,7 @@ def render_production(t: Translator, metrics: dict) -> None:
     fig = go.Figure(points)
     add_line(fig, [0, 1], [0, 1], "y = x", GREY, "dash", showlegend=False)
     with right:
-        st.subheader(t("score_agreement_title", horizon=horizon))
+        st.subheader(t("score_agreement_title", horizon=horizon, variant=t.label(variant)))
         show_chart(fig, t.label("evaluation"), t.label("production"))
 
 
@@ -539,7 +570,9 @@ def render_risk(t: Translator, metrics: dict) -> None:
     scores, curves = table("scores"), table("score_curves")
     horizon, inactivity = metrics["horizon_days"], metrics["inactivity_days"]
     segments = [name for name in ("high", "medium", "low") if name in metrics["risk_segments"]]
-    st.caption(t("risk_note", date=metrics["snapshots"]["scoring"], inactivity=inactivity))
+    variant = t.label(metrics["best_variant"])
+    date = metrics["snapshots"]["scoring"]
+    st.caption(t("risk_note", date=date, variant=variant, inactivity=inactivity))
 
     left, right = st.columns(2)
     counts = scores["risk_segment"].value_counts().reindex(segments, fill_value=0)
@@ -651,7 +684,7 @@ def main() -> None:
     st.sidebar.caption(
         t(
             "sidebar_info",
-            best=t.label(metrics["best_model"]),
+            best=series_name(t, metrics["best_model"], metrics["best_variant"]),
             scoring=metrics["snapshots"]["scoring"],
             generated=metrics["generated_at"][:16].replace("T", " "),
         )
